@@ -3918,6 +3918,58 @@ function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
   return true;
 }
 
+function getPendingBatchIndexesByBatchId_(batchId) {
+  var pending = {};
+  var props = PropertiesService.getScriptProperties();
+  var allProps = props.getProperties();
+  var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
+    return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runLinkRouterAutoSyncBatch';
+  });
+  triggers.forEach(function (trigger) {
+    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+    if (!triggerUid) {
+      return;
+    }
+    var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
+    var triggerInfoJson = allProps[triggerKey];
+    if (!triggerInfoJson) {
+      return;
+    }
+    try {
+      var triggerInfo = JSON.parse(triggerInfoJson);
+      if (triggerInfo.batchId === batchId) {
+        pending[String(triggerInfo.batchIndex)] = true;
+      }
+    } catch (err) {}
+  });
+  return pending;
+}
+
+function schedulePendingLinkRouterBatches_(batchId, totalBatches, delayMs) {
+  var props = PropertiesService.getScriptProperties();
+  var pendingIndexes = getPendingBatchIndexesByBatchId_(batchId);
+  var pendingCount = Object.keys(pendingIndexes).length;
+  var availableSlots = LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS - pendingCount;
+  if (availableSlots <= 0) {
+    return 0;
+  }
+  var scheduled = 0;
+  for (var index = 0; index < totalBatches; index++) {
+    if (scheduled >= availableSlots) {
+      break;
+    }
+    var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
+    var hasState = !!props.getProperty(stateKey);
+    if (!hasState || pendingIndexes[String(index)]) {
+      continue;
+    }
+    if (scheduleLinkRouterAutoSyncBatchTrigger_(batchId, index, delayMs)) {
+      scheduled++;
+    }
+  }
+  return scheduled;
+}
+
 function cleanupOldBatchTriggers_() {
   var props = PropertiesService.getScriptProperties();
   var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
@@ -4010,10 +4062,7 @@ function runLinkRouterAutoSyncOrchestrator() {
     props.setProperty(stateKey, JSON.stringify(state));
   });
 
-  var initialTriggers = Math.min(batches.length, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS);
-  for (var triggerIndex = 0; triggerIndex < initialTriggers; triggerIndex++) {
-    scheduleLinkRouterAutoSyncBatchTrigger_(batchId, triggerIndex, (triggerIndex + 1) * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
-  }
+  schedulePendingLinkRouterBatches_(batchId, batches.length, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
@@ -4149,14 +4198,20 @@ function runLinkRouterAutoSyncBatch(e) {
   }
 
   if (!timedOut) {
-    var nextBatchIndex = state.batchIndex + LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS;
-    if (nextBatchIndex < state.totalBatches) {
-      scheduleLinkRouterAutoSyncBatchTrigger_(state.batchId, nextBatchIndex, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
-    }
+    schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
   }
 
-  if (!timedOut && state.batchIndex === (state.totalBatches - 1)) {
-    cleanupOldBatchTriggers_();
+  if (!timedOut) {
+    var remainingState = false;
+    for (var remainingIndex = 0; remainingIndex < (state.totalBatches || 0); remainingIndex++) {
+      if (props.getProperty(buildLinkRouterBatchStateKey_(state.batchId, remainingIndex))) {
+        remainingState = true;
+        break;
+      }
+    }
+    if (!remainingState) {
+      cleanupOldBatchTriggers_();
+    }
   }
 
   return {
