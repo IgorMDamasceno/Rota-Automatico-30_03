@@ -3905,6 +3905,16 @@ function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
   if (!stateJson) {
     return false;
   }
+  var state;
+  try {
+    state = JSON.parse(stateJson);
+  } catch (err) {
+    props.deleteProperty(stateKey);
+    return false;
+  }
+  if (state.scheduled) {
+    return false;
+  }
   var safeDelayMs = Math.max(delayMs || 0, 60 * 1000);
   var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
     .timeBased()
@@ -3915,52 +3925,33 @@ function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
     var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
     props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: batchIndex }));
   }
+  state.scheduled = true;
+  props.setProperty(stateKey, JSON.stringify(state));
   return true;
 }
 
-function getPendingBatchIndexesByBatchId_(batchId) {
-  var pending = {};
+function schedulePendingLinkRouterBatches_(batchId, totalBatches, delayMs, maxToSchedule) {
   var props = PropertiesService.getScriptProperties();
-  var allProps = props.getProperties();
-  var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
-    return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runLinkRouterAutoSyncBatch';
-  });
-  triggers.forEach(function (trigger) {
-    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
-    if (!triggerUid) {
-      return;
-    }
-    var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
-    var triggerInfoJson = allProps[triggerKey];
-    if (!triggerInfoJson) {
-      return;
-    }
-    try {
-      var triggerInfo = JSON.parse(triggerInfoJson);
-      if (triggerInfo.batchId === batchId) {
-        pending[String(triggerInfo.batchIndex)] = true;
-      }
-    } catch (err) {}
-  });
-  return pending;
-}
-
-function schedulePendingLinkRouterBatches_(batchId, totalBatches, delayMs) {
-  var props = PropertiesService.getScriptProperties();
-  var pendingIndexes = getPendingBatchIndexesByBatchId_(batchId);
-  var pendingCount = Object.keys(pendingIndexes).length;
-  var availableSlots = LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS - pendingCount;
-  if (availableSlots <= 0) {
+  if (!maxToSchedule || maxToSchedule <= 0) {
     return 0;
   }
   var scheduled = 0;
   for (var index = 0; index < totalBatches; index++) {
-    if (scheduled >= availableSlots) {
+    if (scheduled >= maxToSchedule) {
       break;
     }
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
-    var hasState = !!props.getProperty(stateKey);
-    if (!hasState || pendingIndexes[String(index)]) {
+    var stateJson = props.getProperty(stateKey);
+    if (!stateJson) {
+      continue;
+    }
+    try {
+      var state = JSON.parse(stateJson);
+      if (state.scheduled) {
+        continue;
+      }
+    } catch (err) {
+      props.deleteProperty(stateKey);
       continue;
     }
     if (scheduleLinkRouterAutoSyncBatchTrigger_(batchId, index, delayMs)) {
@@ -4056,13 +4047,14 @@ function runLinkRouterAutoSyncOrchestrator() {
       row: rowNumber,
       createdAt: new Date().toISOString(),
       autoRange: autoRange,
-      historySheetName: batchHistorySheetName
+      historySheetName: batchHistorySheetName,
+      scheduled: false
     };
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
     props.setProperty(stateKey, JSON.stringify(state));
   });
 
-  schedulePendingLinkRouterBatches_(batchId, batches.length, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+  schedulePendingLinkRouterBatches_(batchId, batches.length, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS);
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
@@ -4198,7 +4190,7 @@ function runLinkRouterAutoSyncBatch(e) {
   }
 
   if (!timedOut) {
-    schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+    schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
   }
 
   if (!timedOut) {
