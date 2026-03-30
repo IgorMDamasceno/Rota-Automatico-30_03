@@ -30,6 +30,7 @@ const LINK_ROUTER_BATCH_CONTROL_SHEET = 'Controle - Sync Lotes';
 const LINK_ROUTER_SYNC_BATCH_SIZE = 35;
 const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
 const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
+const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 5;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
 
@@ -4009,7 +4010,10 @@ function runLinkRouterAutoSyncOrchestrator() {
     props.setProperty(stateKey, JSON.stringify(state));
   });
 
-  scheduleLinkRouterAutoSyncBatchTrigger_(batchId, 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+  var initialTriggers = Math.min(batches.length, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS);
+  for (var triggerIndex = 0; triggerIndex < initialTriggers; triggerIndex++) {
+    scheduleLinkRouterAutoSyncBatchTrigger_(batchId, triggerIndex, (triggerIndex + 1) * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+  }
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
@@ -4144,8 +4148,11 @@ function runLinkRouterAutoSyncBatch(e) {
     });
   }
 
-  if (!timedOut && state.batchIndex < (state.totalBatches - 1)) {
-    scheduleLinkRouterAutoSyncBatchTrigger_(state.batchId, state.batchIndex + 1, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+  if (!timedOut) {
+    var nextBatchIndex = state.batchIndex + LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS;
+    if (nextBatchIndex < state.totalBatches) {
+      scheduleLinkRouterAutoSyncBatchTrigger_(state.batchId, nextBatchIndex, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
+    }
   }
 
   if (!timedOut && state.batchIndex === (state.totalBatches - 1)) {
