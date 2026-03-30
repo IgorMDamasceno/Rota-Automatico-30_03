@@ -3897,6 +3897,26 @@ function splitIntoBatches_(items, batchSize) {
   return batches;
 }
 
+function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
+  var props = PropertiesService.getScriptProperties();
+  var stateKey = buildLinkRouterBatchStateKey_(batchId, batchIndex);
+  var stateJson = props.getProperty(stateKey);
+  if (!stateJson) {
+    return false;
+  }
+  var safeDelayMs = Math.max(delayMs || 0, 60 * 1000);
+  var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
+    .timeBased()
+    .after(safeDelayMs)
+    .create();
+  var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+  if (triggerUid) {
+    var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
+    props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: batchIndex }));
+  }
+  return true;
+}
+
 function cleanupOldBatchTriggers_() {
   var props = PropertiesService.getScriptProperties();
   var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
@@ -3987,19 +4007,9 @@ function runLinkRouterAutoSyncOrchestrator() {
     };
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
     props.setProperty(stateKey, JSON.stringify(state));
-    var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
-    // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
-    var safeDelayMs = Math.max(delayMs, 60 * 1000);
-    var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
-      .timeBased()
-      .after(safeDelayMs)
-      .create();
-    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
-    if (triggerUid) {
-      var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
-      props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: index }));
-    }
   });
+
+  scheduleLinkRouterAutoSyncBatchTrigger_(batchId, 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
@@ -4132,6 +4142,10 @@ function runLinkRouterAutoSyncBatch(e) {
         ScriptApp.deleteTrigger(trigger);
       }
     });
+  }
+
+  if (!timedOut && state.batchIndex < (state.totalBatches - 1)) {
+    scheduleLinkRouterAutoSyncBatchTrigger_(state.batchId, state.batchIndex + 1, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000);
   }
 
   if (!timedOut && state.batchIndex === (state.totalBatches - 1)) {
