@@ -30,8 +30,12 @@ const LINK_ROUTER_BATCH_CONTROL_SHEET = 'Controle - Sync Lotes';
 const LINK_ROUTER_SYNC_BATCH_SIZE = 35;
 const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
 const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
+const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 5;
+const LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT = 2;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
+const LINK_ROUTER_INVALID_ROUTE_KEY_PREFIX = 'LINK_ROUTER_INVALID_ROUTE_';
+const LINK_ROUTER_INVALID_ROUTE_TTL_HOURS = 24;
 
 function doGet(e) {
   var page = (e && e.parameter && e.parameter.page) ? String(e.parameter.page) : '';
@@ -3851,6 +3855,61 @@ function buildLinkRouterBatchTriggerKey_(triggerUid) {
   return LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX + triggerUid;
 }
 
+function buildLinkRouterIntegrationTimeoutKey_(integration) {
+  integration = integration || {};
+  return [
+    String(integration.operation || ''),
+    String(integration.trafficType || ''),
+    String(integration.routeSlug || '')
+  ].join('|');
+}
+
+function buildInvalidRouteKey_(integration) {
+  integration = integration || {};
+  return LINK_ROUTER_INVALID_ROUTE_KEY_PREFIX + [
+    String(integration.companyId || ''),
+    String(integration.domainId || ''),
+    String(integration.routeSlug || '')
+  ].join('|');
+}
+
+function isRouteNotFoundError_(message) {
+  var text = String(message || '').toLowerCase();
+  return text.indexOf('não encontrada') >= 0 ||
+    text.indexOf('nao encontrada') >= 0 ||
+    text.indexOf('not found') >= 0 ||
+    text.indexOf('slug informado') >= 0 ||
+    text.indexOf('nenhum link encontrado na api') >= 0;
+}
+
+function markInvalidRoute_(integration, errorMessage) {
+  var props = PropertiesService.getScriptProperties();
+  var key = buildInvalidRouteKey_(integration);
+  props.setProperty(key, JSON.stringify({
+    at: new Date().toISOString(),
+    message: errorMessage || 'Rota inválida.'
+  }));
+}
+
+function getInvalidRouteInfo_(integration) {
+  var props = PropertiesService.getScriptProperties();
+  var key = buildInvalidRouteKey_(integration);
+  var raw = props.getProperty(key);
+  if (!raw) {
+    return null;
+  }
+  try {
+    var info = JSON.parse(raw);
+    var atMs = info && info.at ? new Date(info.at).getTime() : 0;
+    var maxAgeMs = LINK_ROUTER_INVALID_ROUTE_TTL_HOURS * 60 * 60 * 1000;
+    if (atMs && (Date.now() - atMs) <= maxAgeMs) {
+      return info;
+    }
+  } catch (err) {}
+  props.deleteProperty(key);
+  return null;
+}
+
 function appendLinkRouterBatchControlRow_(sheet, info) {
   var values = [
     info && info.timestamp ? info.timestamp : new Date(),
@@ -3895,6 +3954,88 @@ function splitIntoBatches_(items, batchSize) {
     batches.push(items.slice(i, i + batchSize));
   }
   return batches;
+}
+
+function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
+  var props = PropertiesService.getScriptProperties();
+  var stateKey = buildLinkRouterBatchStateKey_(batchId, batchIndex);
+  var stateJson = props.getProperty(stateKey);
+  if (!stateJson) {
+    return false;
+  }
+  var state;
+  try {
+    state = JSON.parse(stateJson);
+  } catch (err) {
+    props.deleteProperty(stateKey);
+    return false;
+  }
+  if (state.scheduled) {
+    return false;
+  }
+  var nextEligibleAtMs = state.nextEligibleAt ? new Date(state.nextEligibleAt).getTime() : 0;
+  if (nextEligibleAtMs && Date.now() < nextEligibleAtMs) {
+    return false;
+  }
+  var safeDelayMs = Math.max(delayMs || 0, 60 * 1000);
+  var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
+    .timeBased()
+    .after(safeDelayMs)
+    .create();
+  var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+  if (triggerUid) {
+    var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
+    props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: batchIndex }));
+  }
+  state.scheduled = true;
+  state.nextEligibleAt = null;
+  props.setProperty(stateKey, JSON.stringify(state));
+  return true;
+}
+
+function schedulePendingLinkRouterBatches_(batchId, totalBatches, delayMs, maxToSchedule) {
+  var props = PropertiesService.getScriptProperties();
+  if (!maxToSchedule || maxToSchedule <= 0) {
+    return 0;
+  }
+  var scheduled = 0;
+  var trySchedule = function (ignoreEligibilityWindow) {
+    for (var index = 0; index < totalBatches; index++) {
+      if (scheduled >= maxToSchedule) {
+        break;
+      }
+      var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
+      var stateJson = props.getProperty(stateKey);
+      if (!stateJson) {
+        continue;
+      }
+      var state;
+      try {
+        state = JSON.parse(stateJson);
+      } catch (err) {
+        props.deleteProperty(stateKey);
+        continue;
+      }
+      if (state.scheduled) {
+        continue;
+      }
+      if (!ignoreEligibilityWindow && state.nextEligibleAt) {
+        var nextEligibleAtMs = new Date(state.nextEligibleAt).getTime();
+        if (nextEligibleAtMs && Date.now() < nextEligibleAtMs) {
+          continue;
+        }
+      }
+      if (scheduleLinkRouterAutoSyncBatchTrigger_(batchId, index, delayMs)) {
+        scheduled++;
+      }
+    }
+  };
+
+  trySchedule(false);
+  if (scheduled === 0) {
+    trySchedule(true);
+  }
+  return scheduled;
 }
 
 function cleanupOldBatchTriggers_() {
@@ -3948,7 +4089,10 @@ function runLinkRouterAutoSyncOrchestrator() {
   cleanupOldBatchTriggers_();
   var snapshot = getConfigSnapshot_();
   var integrations = (snapshot.operationIntegrationRows || []).filter(function (row) {
-    return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
+    if (!row || !row.active || !row.operation || !row.companyId || !row.domainId || !row.routeSlug || !row.trafficType) {
+      return false;
+    }
+    return !getInvalidRouteInfo_(row);
   });
   if (!integrations.length) {
     updateLinkRouterAutoSyncTrigger_(snapshot);
@@ -3983,23 +4127,14 @@ function runLinkRouterAutoSyncOrchestrator() {
       row: rowNumber,
       createdAt: new Date().toISOString(),
       autoRange: autoRange,
-      historySheetName: batchHistorySheetName
+      historySheetName: batchHistorySheetName,
+      scheduled: false
     };
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
     props.setProperty(stateKey, JSON.stringify(state));
-    var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
-    // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
-    var safeDelayMs = Math.max(delayMs, 60 * 1000);
-    var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
-      .timeBased()
-      .after(safeDelayMs)
-      .create();
-    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
-    if (triggerUid) {
-      var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
-      props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: index }));
-    }
   });
+
+  schedulePendingLinkRouterBatches_(batchId, batches.length, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS);
 
   updateLinkRouterAutoSyncTrigger_(snapshot);
 
@@ -4051,17 +4186,28 @@ function runLinkRouterAutoSyncBatch(e) {
   var failures = [];
   var processed = 0;
   var timedOut = false;
+  var remainingIntegrations = [];
 
-  (state.integrations || []).forEach(function (integration) {
-    if (timedOut) {
-      return;
-    }
+  var integrations = state.integrations || [];
+  for (var integrationIndex = 0; integrationIndex < integrations.length; integrationIndex++) {
+    var integration = integrations[integrationIndex];
     var elapsed = (Date.now() - startMs) / 1000;
     if (elapsed >= LINK_ROUTER_SYNC_BATCH_MAX_SECONDS) {
       timedOut = true;
-      return;
+      remainingIntegrations = integrations.slice(integrationIndex);
+      break;
     }
     var trafficType = integration.trafficType;
+    var invalidRouteInfo = getInvalidRouteInfo_(integration);
+    if (invalidRouteInfo) {
+      failures.push({
+        operation: integration.operation,
+        traffic: trafficType,
+        message: 'Rota ignorada temporariamente (inválida): ' + (invalidRouteInfo.message || 'sem detalhe')
+      });
+      processed++;
+      continue;
+    }
     var sources = trafficByType[trafficType] || [];
     if (!sources.length) {
       var missingError = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
@@ -4072,7 +4218,7 @@ function runLinkRouterAutoSyncBatch(e) {
       });
       logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName);
       processed++;
-      return;
+      continue;
     }
     try {
       var request = {
@@ -4096,19 +4242,44 @@ function runLinkRouterAutoSyncBatch(e) {
         leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
       });
     } catch (err) {
+      var errorMessage = err && err.message ? err.message : String(err);
+      if (isRouteNotFoundError_(errorMessage)) {
+        markInvalidRoute_(integration, errorMessage);
+      }
       failures.push({
         operation: integration.operation,
         traffic: trafficType,
-        message: err && err.message ? err.message : String(err)
+        message: errorMessage
       });
       logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
     }
     processed++;
-  });
+  }
 
   var durationSeconds = Math.round((Date.now() - startMs) / 1000);
   var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
-  var message = timedOut ? 'Execução interrompida por tempo limite.' : '';
+  var message = timedOut ? ('Execução interrompida por tempo limite. Restantes: ' + remainingIntegrations.length + '.') : '';
+  if (timedOut && remainingIntegrations.length) {
+    var blockedIntegration = remainingIntegrations.shift();
+    var timeoutRetries = state.timeoutRetries || {};
+    var timeoutKey = buildLinkRouterIntegrationTimeoutKey_(blockedIntegration);
+    var timeoutCount = (timeoutRetries[timeoutKey] || 0) + 1;
+    timeoutRetries[timeoutKey] = timeoutCount;
+    state.timeoutRetries = timeoutRetries;
+
+    if (timeoutCount <= LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT) {
+      remainingIntegrations.push(blockedIntegration);
+      message += ' Rota travada reagendada para o final da fila (tentativa ' + timeoutCount + '/' + LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT + ').';
+    } else {
+      failures.push({
+        operation: blockedIntegration.operation,
+        traffic: blockedIntegration.trafficType,
+        message: 'Rota pulada após exceder limite de timeout (' + timeoutCount + ' tentativas).'
+      });
+      logLinkRouterAutoSyncFailure_(blockedIntegration, blockedIntegration.trafficType, new Error('Rota pulada após exceder limite de timeout.'), batchHistorySheetName);
+      message += ' Rota pulada após exceder limite de timeout.';
+    }
+  }
   updateLinkRouterBatchControlRow_(state.row, {
     timestamp: startTime,
     batchId: state.batchId,
@@ -4121,7 +4292,14 @@ function runLinkRouterAutoSyncBatch(e) {
     message: message
   });
 
-  props.deleteProperty(stateKey);
+  if (timedOut && remainingIntegrations.length) {
+    state.integrations = remainingIntegrations;
+    state.scheduled = false;
+    state.nextEligibleAt = new Date(Date.now() + (LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000)).toISOString();
+    props.setProperty(stateKey, JSON.stringify(state));
+  } else {
+    props.deleteProperty(stateKey);
+  }
   if (triggerKey) {
     props.deleteProperty(triggerKey);
   }
@@ -4134,7 +4312,16 @@ function runLinkRouterAutoSyncBatch(e) {
     });
   }
 
-  if (!timedOut && state.batchIndex === (state.totalBatches - 1)) {
+  schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
+
+  var remainingState = false;
+  for (var remainingIndex = 0; remainingIndex < (state.totalBatches || 0); remainingIndex++) {
+    if (props.getProperty(buildLinkRouterBatchStateKey_(state.batchId, remainingIndex))) {
+      remainingState = true;
+      break;
+    }
+  }
+  if (!remainingState) {
     cleanupOldBatchTriggers_();
   }
 
