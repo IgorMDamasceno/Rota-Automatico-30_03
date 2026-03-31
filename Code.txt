@@ -4106,15 +4106,16 @@ function runLinkRouterAutoSyncBatch(e) {
   var failures = [];
   var processed = 0;
   var timedOut = false;
+  var remainingIntegrations = [];
 
-  (state.integrations || []).forEach(function (integration) {
-    if (timedOut) {
-      return;
-    }
+  var integrations = state.integrations || [];
+  for (var integrationIndex = 0; integrationIndex < integrations.length; integrationIndex++) {
+    var integration = integrations[integrationIndex];
     var elapsed = (Date.now() - startMs) / 1000;
     if (elapsed >= LINK_ROUTER_SYNC_BATCH_MAX_SECONDS) {
       timedOut = true;
-      return;
+      remainingIntegrations = integrations.slice(integrationIndex);
+      break;
     }
     var trafficType = integration.trafficType;
     var sources = trafficByType[trafficType] || [];
@@ -4127,7 +4128,7 @@ function runLinkRouterAutoSyncBatch(e) {
       });
       logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName);
       processed++;
-      return;
+      continue;
     }
     try {
       var request = {
@@ -4159,11 +4160,11 @@ function runLinkRouterAutoSyncBatch(e) {
       logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
     }
     processed++;
-  });
+  }
 
   var durationSeconds = Math.round((Date.now() - startMs) / 1000);
   var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
-  var message = timedOut ? 'Execução interrompida por tempo limite.' : '';
+  var message = timedOut ? ('Execução interrompida por tempo limite. Restantes: ' + remainingIntegrations.length + '.') : '';
   updateLinkRouterBatchControlRow_(state.row, {
     timestamp: startTime,
     batchId: state.batchId,
@@ -4176,7 +4177,13 @@ function runLinkRouterAutoSyncBatch(e) {
     message: message
   });
 
-  props.deleteProperty(stateKey);
+  if (timedOut && remainingIntegrations.length) {
+    state.integrations = remainingIntegrations;
+    state.scheduled = false;
+    props.setProperty(stateKey, JSON.stringify(state));
+  } else {
+    props.deleteProperty(stateKey);
+  }
   if (triggerKey) {
     props.deleteProperty(triggerKey);
   }
@@ -4189,21 +4196,17 @@ function runLinkRouterAutoSyncBatch(e) {
     });
   }
 
-  if (!timedOut) {
-    schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
-  }
+  schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
 
-  if (!timedOut) {
-    var remainingState = false;
-    for (var remainingIndex = 0; remainingIndex < (state.totalBatches || 0); remainingIndex++) {
-      if (props.getProperty(buildLinkRouterBatchStateKey_(state.batchId, remainingIndex))) {
-        remainingState = true;
-        break;
-      }
+  var remainingState = false;
+  for (var remainingIndex = 0; remainingIndex < (state.totalBatches || 0); remainingIndex++) {
+    if (props.getProperty(buildLinkRouterBatchStateKey_(state.batchId, remainingIndex))) {
+      remainingState = true;
+      break;
     }
-    if (!remainingState) {
-      cleanupOldBatchTriggers_();
-    }
+  }
+  if (!remainingState) {
+    cleanupOldBatchTriggers_();
   }
 
   return {
