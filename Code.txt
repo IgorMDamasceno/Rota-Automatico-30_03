@@ -31,6 +31,7 @@ const LINK_ROUTER_SYNC_BATCH_SIZE = 35;
 const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
 const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
 const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 5;
+const LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT = 2;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
 
@@ -3852,6 +3853,15 @@ function buildLinkRouterBatchTriggerKey_(triggerUid) {
   return LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX + triggerUid;
 }
 
+function buildLinkRouterIntegrationTimeoutKey_(integration) {
+  integration = integration || {};
+  return [
+    String(integration.operation || ''),
+    String(integration.trafficType || ''),
+    String(integration.routeSlug || '')
+  ].join('|');
+}
+
 function appendLinkRouterBatchControlRow_(sheet, info) {
   var values = [
     info && info.timestamp ? info.timestamp : new Date(),
@@ -4184,6 +4194,27 @@ function runLinkRouterAutoSyncBatch(e) {
   var durationSeconds = Math.round((Date.now() - startMs) / 1000);
   var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
   var message = timedOut ? ('Execução interrompida por tempo limite. Restantes: ' + remainingIntegrations.length + '.') : '';
+  if (timedOut && remainingIntegrations.length) {
+    var blockedIntegration = remainingIntegrations.shift();
+    var timeoutRetries = state.timeoutRetries || {};
+    var timeoutKey = buildLinkRouterIntegrationTimeoutKey_(blockedIntegration);
+    var timeoutCount = (timeoutRetries[timeoutKey] || 0) + 1;
+    timeoutRetries[timeoutKey] = timeoutCount;
+    state.timeoutRetries = timeoutRetries;
+
+    if (timeoutCount <= LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT) {
+      remainingIntegrations.push(blockedIntegration);
+      message += ' Rota travada reagendada para o final da fila (tentativa ' + timeoutCount + '/' + LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT + ').';
+    } else {
+      failures.push({
+        operation: blockedIntegration.operation,
+        traffic: blockedIntegration.trafficType,
+        message: 'Rota pulada após exceder limite de timeout (' + timeoutCount + ' tentativas).'
+      });
+      logLinkRouterAutoSyncFailure_(blockedIntegration, blockedIntegration.trafficType, new Error('Rota pulada após exceder limite de timeout.'), batchHistorySheetName);
+      message += ' Rota pulada após exceder limite de timeout.';
+    }
+  }
   updateLinkRouterBatchControlRow_(state.row, {
     timestamp: startTime,
     batchId: state.batchId,
