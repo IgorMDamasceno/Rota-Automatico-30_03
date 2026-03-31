@@ -3915,6 +3915,10 @@ function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
   if (state.scheduled) {
     return false;
   }
+  var nextEligibleAtMs = state.nextEligibleAt ? new Date(state.nextEligibleAt).getTime() : 0;
+  if (nextEligibleAtMs && Date.now() < nextEligibleAtMs) {
+    return false;
+  }
   var safeDelayMs = Math.max(delayMs || 0, 60 * 1000);
   var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
     .timeBased()
@@ -3926,6 +3930,7 @@ function scheduleLinkRouterAutoSyncBatchTrigger_(batchId, batchIndex, delayMs) {
     props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: batchIndex }));
   }
   state.scheduled = true;
+  state.nextEligibleAt = null;
   props.setProperty(stateKey, JSON.stringify(state));
   return true;
 }
@@ -3936,27 +3941,41 @@ function schedulePendingLinkRouterBatches_(batchId, totalBatches, delayMs, maxTo
     return 0;
   }
   var scheduled = 0;
-  for (var index = 0; index < totalBatches; index++) {
-    if (scheduled >= maxToSchedule) {
-      break;
-    }
-    var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
-    var stateJson = props.getProperty(stateKey);
-    if (!stateJson) {
-      continue;
-    }
-    try {
-      var state = JSON.parse(stateJson);
+  var trySchedule = function (ignoreEligibilityWindow) {
+    for (var index = 0; index < totalBatches; index++) {
+      if (scheduled >= maxToSchedule) {
+        break;
+      }
+      var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
+      var stateJson = props.getProperty(stateKey);
+      if (!stateJson) {
+        continue;
+      }
+      var state;
+      try {
+        state = JSON.parse(stateJson);
+      } catch (err) {
+        props.deleteProperty(stateKey);
+        continue;
+      }
       if (state.scheduled) {
         continue;
       }
-    } catch (err) {
-      props.deleteProperty(stateKey);
-      continue;
+      if (!ignoreEligibilityWindow && state.nextEligibleAt) {
+        var nextEligibleAtMs = new Date(state.nextEligibleAt).getTime();
+        if (nextEligibleAtMs && Date.now() < nextEligibleAtMs) {
+          continue;
+        }
+      }
+      if (scheduleLinkRouterAutoSyncBatchTrigger_(batchId, index, delayMs)) {
+        scheduled++;
+      }
     }
-    if (scheduleLinkRouterAutoSyncBatchTrigger_(batchId, index, delayMs)) {
-      scheduled++;
-    }
+  };
+
+  trySchedule(false);
+  if (scheduled === 0) {
+    trySchedule(true);
   }
   return scheduled;
 }
@@ -4180,6 +4199,7 @@ function runLinkRouterAutoSyncBatch(e) {
   if (timedOut && remainingIntegrations.length) {
     state.integrations = remainingIntegrations;
     state.scheduled = false;
+    state.nextEligibleAt = new Date(Date.now() + (LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000)).toISOString();
     props.setProperty(stateKey, JSON.stringify(state));
   } else {
     props.deleteProperty(stateKey);
