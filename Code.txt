@@ -34,6 +34,8 @@ const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 5;
 const LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT = 2;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
+const LINK_ROUTER_INVALID_ROUTE_KEY_PREFIX = 'LINK_ROUTER_INVALID_ROUTE_';
+const LINK_ROUTER_INVALID_ROUTE_TTL_HOURS = 24;
 
 function doGet(e) {
   var page = (e && e.parameter && e.parameter.page) ? String(e.parameter.page) : '';
@@ -3862,6 +3864,52 @@ function buildLinkRouterIntegrationTimeoutKey_(integration) {
   ].join('|');
 }
 
+function buildInvalidRouteKey_(integration) {
+  integration = integration || {};
+  return LINK_ROUTER_INVALID_ROUTE_KEY_PREFIX + [
+    String(integration.companyId || ''),
+    String(integration.domainId || ''),
+    String(integration.routeSlug || '')
+  ].join('|');
+}
+
+function isRouteNotFoundError_(message) {
+  var text = String(message || '').toLowerCase();
+  return text.indexOf('não encontrada') >= 0 ||
+    text.indexOf('nao encontrada') >= 0 ||
+    text.indexOf('not found') >= 0 ||
+    text.indexOf('slug informado') >= 0 ||
+    text.indexOf('nenhum link encontrado na api') >= 0;
+}
+
+function markInvalidRoute_(integration, errorMessage) {
+  var props = PropertiesService.getScriptProperties();
+  var key = buildInvalidRouteKey_(integration);
+  props.setProperty(key, JSON.stringify({
+    at: new Date().toISOString(),
+    message: errorMessage || 'Rota inválida.'
+  }));
+}
+
+function getInvalidRouteInfo_(integration) {
+  var props = PropertiesService.getScriptProperties();
+  var key = buildInvalidRouteKey_(integration);
+  var raw = props.getProperty(key);
+  if (!raw) {
+    return null;
+  }
+  try {
+    var info = JSON.parse(raw);
+    var atMs = info && info.at ? new Date(info.at).getTime() : 0;
+    var maxAgeMs = LINK_ROUTER_INVALID_ROUTE_TTL_HOURS * 60 * 60 * 1000;
+    if (atMs && (Date.now() - atMs) <= maxAgeMs) {
+      return info;
+    }
+  } catch (err) {}
+  props.deleteProperty(key);
+  return null;
+}
+
 function appendLinkRouterBatchControlRow_(sheet, info) {
   var values = [
     info && info.timestamp ? info.timestamp : new Date(),
@@ -4041,7 +4089,10 @@ function runLinkRouterAutoSyncOrchestrator() {
   cleanupOldBatchTriggers_();
   var snapshot = getConfigSnapshot_();
   var integrations = (snapshot.operationIntegrationRows || []).filter(function (row) {
-    return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
+    if (!row || !row.active || !row.operation || !row.companyId || !row.domainId || !row.routeSlug || !row.trafficType) {
+      return false;
+    }
+    return !getInvalidRouteInfo_(row);
   });
   if (!integrations.length) {
     updateLinkRouterAutoSyncTrigger_(snapshot);
@@ -4147,6 +4198,16 @@ function runLinkRouterAutoSyncBatch(e) {
       break;
     }
     var trafficType = integration.trafficType;
+    var invalidRouteInfo = getInvalidRouteInfo_(integration);
+    if (invalidRouteInfo) {
+      failures.push({
+        operation: integration.operation,
+        traffic: trafficType,
+        message: 'Rota ignorada temporariamente (inválida): ' + (invalidRouteInfo.message || 'sem detalhe')
+      });
+      processed++;
+      continue;
+    }
     var sources = trafficByType[trafficType] || [];
     if (!sources.length) {
       var missingError = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
@@ -4181,10 +4242,14 @@ function runLinkRouterAutoSyncBatch(e) {
         leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
       });
     } catch (err) {
+      var errorMessage = err && err.message ? err.message : String(err);
+      if (isRouteNotFoundError_(errorMessage)) {
+        markInvalidRoute_(integration, errorMessage);
+      }
       failures.push({
         operation: integration.operation,
         traffic: trafficType,
-        message: err && err.message ? err.message : String(err)
+        message: errorMessage
       });
       logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
     }
